@@ -6,6 +6,15 @@
 - GET  /vessels                      已接收船舶清单
 - GET  /trajectories/{mmsi}         按 MMSI 读取连续轨迹（不返回缺口后的记录）
 - POST /admin/reset                  清空归档并重置进度（演示用）
+- POST /admin/inject-gap             故障注入：删除指定序号并回退水位
+- POST /admin/rewind-backfill        强制回退历史游标（演示自愈；正常无需调用）
+
+问题定位（写锁导致的采集卡死）：
+- 数据库层读写连接分离：写锁被另一连接长时间持有时，状态/错误/轨迹
+  查询仍可从读连接读取已提交数据（WAL 快照）。
+- 采集循环对写锁失败做有限重试 + 退避，绝不退出；历史游标只在整页
+  提交成功后推进。
+- 水位落后于已见最大序号时自动回退历史游标补齐，无需重启或手工回退。
 """
 
 from __future__ import annotations
@@ -50,6 +59,10 @@ class StatusOut(BaseModel):
     history_received: int
     history_requests: int
     history_failures: int
+    db_write_failures: int
+    gap_repairs: int
+    db_write_lock_waits: int
+    pending_error_records: int
     last_event_at: float | None
     last_history_at: float | None
     last_backfill_seq: int | None
@@ -157,6 +170,10 @@ async def status() -> StatusOut:
         history_received=engine.history_received,
         history_requests=engine.history_requests,
         history_failures=engine.history_failures,
+        db_write_failures=engine.db_write_failures,
+        gap_repairs=engine.gap_repairs,
+        db_write_lock_waits=db.write_lock_waits,
+        pending_error_records=len(engine._pending_errors),
         last_event_at=engine.last_event_at,
         last_history_at=engine.last_history_at,
         last_backfill_seq=engine.last_backfill_seq,
@@ -233,12 +250,18 @@ async def admin_reset() -> dict[str, str]:
     engine.history_received = 0
     engine.history_requests = 0
     engine.history_failures = 0
+    engine.db_write_failures = 0
+    engine.gap_repairs = 0
     engine.last_event_at = None
     engine.last_history_at = None
     engine.last_backfill_seq = None
     engine.max_seen_seq = 0
     engine._backfill_open_error = None
     engine._sse_open_error = None
+    engine._sse_db_error = None
+    engine._pending_errors.clear()
+    engine._needs_startup_repair = False
+    engine._last_watermark = 0
     return {"status": "reset done"}
 
 
@@ -252,6 +275,7 @@ async def admin_inject_gap(body: GapIn) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail="seqs 不能为空")
     deleted = await db.delete_positions(seqs)
     new_watermark = await db.recompute_watermark()
+    # 引擎会在水位之后发现缺口并自动回退历史游标补齐（无需手工接口）
     return {
         "deleted": deleted,
         "requested": seqs,
@@ -261,7 +285,7 @@ async def admin_inject_gap(body: GapIn) -> dict[str, Any]:
 
 @app.post(
     "/admin/rewind-backfill",
-    summary="把历史补采游标回退到连续水位，重新补采缺口区间（演示补齐）",
+    summary="强制把历史补采游标回退到连续水位（演示；正常自愈无需调用）",
 )
 async def admin_rewind_backfill() -> dict[str, Any]:
     watermark = await db.get_watermark()

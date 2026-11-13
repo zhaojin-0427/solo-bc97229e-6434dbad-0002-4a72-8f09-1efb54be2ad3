@@ -29,11 +29,22 @@ services:
       DB_PATH: "/data/collector.db"
       HISTORY_PAGE_SIZE: "50"
       SSE_READ_TIMEOUT: "60"
+      # 写锁等待预算：busy_timeout×重试次数 ≈ 10.5s，超出后采集循环退避重试
+      SQLITE_BUSY_TIMEOUT_MS: "5000"
+      DB_WRITE_RETRY_ATTEMPTS: "2"
+      DB_WRITE_RETRY_DELAY: "0.5"
     volumes:
       - collector-data:/data
     depends_on:
       station:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
 
 volumes:
   collector-data:

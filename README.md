@@ -37,6 +37,10 @@
 | 轨迹不越过缺口 | 查询以 `contiguous_seq` 为可见上界，缺口之后的记录一律不返回 |
 | 重启自动接续 | 船位、水位、历史游标、错误全部在 SQLite；启动即恢复并继续补采 |
 | 岸站重置可自愈 | 检测到序号代际回退时自动把补采游标回 0 重新补采（记录为已解决告警） |
+| **写锁不中断采集** | 写连接有界重试（`busy_timeout × 重试次数`）后抛 `DatabaseBusy`，采集循环退避重试、永不退出；失败写入不推进水位/游标，稍后重放 |
+| **持锁期间可查询** | 读写连接分离，WAL 快照让 `/status`、`/errors`、`/trajectories` 在写锁等待期间仍能读到已提交数据 |
+| **锁释放后自动补齐** | 水位落后于已见最大序号且游标已越过水位时，历史循环自动把游标回退到水位重放，无需重启或调用回退接口 |
+| **错误登记遇锁不丢** | 锁被远端持有时错误登记快速失败并暂存内存，锁释放后补记并标记已恢复 |
 
 ## 2. 快速启动（Docker Compose）
 
@@ -69,7 +73,11 @@ docker compose down -v         # 停止并删除归档数据
 | GET | `/trajectories/{mmsi}?limit=` | 按 MMSI 读取轨迹（仅返回连续水位内记录，按 seq 升序） |
 | POST | `/admin/reset` | 清空归档并重置进度（演示用） |
 | POST | `/admin/inject-gap` | 故障注入：删除指定序号，水位回退，演示轨迹截断语义 |
-| POST | `/admin/rewind-backfill` | 历史游标回退到水位，重新补采缺口区间 |
+| POST | `/admin/rewind-backfill` | 历史游标回退到水位（仅演示；采集器会自动自愈，无需调用） |
+
+`/status` 额外暴露本次故障的观测指标：`db_write_failures`（写锁等待失败次数）、
+`db_write_lock_waits`（数据库层观测到的锁冲突次数）、`gap_repairs`（自动回退游标
+补齐缺口的次数）、`pending_error_records`（锁期间暂存在内存、待补记的错误数）。
 
 ### 模拟岸站（端口 8000）
 
@@ -102,8 +110,27 @@ docker compose down -v         # 停止并删除归档数据
    - POST `/admin/inject-gap`，body 例如 `{"seqs": [50]}`；
    - `/status` 显示 `contiguous_seq=49`、`next_missing_seqs=[50]`；
    - 再查轨迹：所有返回点 `seq ≤ 49`，缺口之后的记录不可见；
-   - POST `/admin/rewind-backfill`，数秒内补齐，轨迹恢复。
+   - 无需任何手工操作：采集器会自动把历史游标回退到水位并重放缺口，
+     数秒内补齐、轨迹恢复（`/status` 的 `gap_repairs` 增加）；
+     `/admin/rewind-backfill` 仅保留为演示用的强制手段。
 6. **错误查询**：GET `/errors?include_resolved=true` 查看完整故障史与恢复时间。
+7. **演练写锁不中断采集**（命令行，非 Swagger）：
+
+   在采集器容器内用另一连接对 `/data/collector.db` 持写锁 20 秒
+   （超过 5s `busy_timeout`）：
+
+   ```bash
+   docker compose exec collector python - <<'PY'
+   import sqlite3, time
+   conn = sqlite3.connect('/data/collector.db', timeout=30, isolation_level=None)
+   conn.execute('BEGIN IMMEDIATE'); time.sleep(20); conn.rollback()
+   PY
+   ```
+
+   持锁期间反复 GET `/status`、`/errors`、`/trajectories`：立即返回已提交数据；
+   锁释放后观察 `/status`：自动补齐、`complete=true`，无需重启或回退接口。
+
+   `tests/lock_regression_test.py` 会用同样的方式自动注入持锁并断言上述行为。
 
 ## 5. 中断重启演示
 
@@ -137,17 +164,32 @@ STATION_URL=http://127.0.0.1:8000 DB_PATH=./data/collector.db \
 
 ## 8. 自动化测试
 
-测试只通过 HTTP 驱动，对 Docker 环境与本地进程同样适用：
-
 ```bash
-# 基础容错与缺口语义（31 项断言）
+# 基础容错与缺口语义（32 项断言）
 python3 tests/e2e_test.py
 # 真正杀进程重启的接续测试
-python3 tests/restart_test.py
+python3 tests/restart_test.py --pylibs <依赖目录>
+# 写锁 / 网络恢复 / 双通道交错回归（需要运行中的两个服务）
+python3 tests/lock_regression_test.py
+# 数据库层确定性回归（无需启动任何服务，临时 SQLite）
+PYTHONPATH=. python3 tests/lock_unit_test.py
 ```
 
-覆盖：初始去重采集、翻页 100% 失败期间实时不中断、断流/重连补齐、
-缺口注入后轨迹截断与回补、重启后进度保留与自动接续。
+`lock_regression_test.py` 在“历史接口恢复、补采开始”的时点用另一连接
+`BEGIN IMMEDIATE` 持写锁超过 `busy_timeout`，断言：
+
+- 持锁期间 `/status`、`/errors` 持续可读且读到已提交数据（读写连接分离）；
+- 写入等待重试超出预算后采集循环不退出（`db_write_failures` 增加），
+  失败写入不推进水位/游标；
+- 锁释放后自动补齐缺口（`gap_repairs` 增加），`complete=true`，无需重启、
+  未调用 `/admin/rewind-backfill`；
+- 两路重叠仍只入库一次、库内 seq 唯一；缺口后的船位不可查询；
+- 持锁期间杀掉进程再重启，按已提交进度接续并最终补齐。
+
+数据库层测试用可控的短超时验证同一语义（持锁写入抛 `DatabaseBusy` 而非卡死、
+锁期间读已提交数据、整页游标不前进、释放后重放去重、错误登记暂存后补记）。
+Docker 环境下可传 `--restart-command "docker compose restart collector"`。
+
 
 ## 9. 目录结构
 
@@ -163,7 +205,9 @@ python3 tests/restart_test.py
 │   └── app.py                # FastAPI：状态/错误/船舶/轨迹/管理接口
 └── tests/
     ├── e2e_test.py
-    └── restart_test.py
+    ├── restart_test.py
+    ├── lock_regression_test.py   # 持写锁/网络恢复/双通道交错回归
+    └── lock_unit_test.py         # 数据库层确定性回归（无需服务）
 ```
 
 ## 10. 主要环境变量
@@ -178,3 +222,8 @@ python3 tests/restart_test.py
 | `HISTORY_PAGE_SIZE` | 50 | 采集器补采分页大小 |
 | `SSE_READ_TIMEOUT` | 60 | SSE 读超时（秒），超时判定断流并重连 |
 | `SSE_RECONNECT_MAX` / `HISTORY_RETRY_MAX` | 30 / 30 | 两类重试的最大退避（秒） |
+| `SQLITE_BUSY_TIMEOUT_MS` | 5000 | 单次写锁等待上限（毫秒） |
+| `DB_WRITE_RETRY_ATTEMPTS` / `DB_WRITE_RETRY_DELAY` | 2 / 0.5 | 数据库层重试次数与退避基数（秒）；预算约 10.5s |
+| `ERROR_WRITE_BUSY_TIMEOUT_MS` | 250 | 错误登记专用短超时，避免持锁时拖住采集 |
+| `LOCK_RETRY_BASE` / `LOCK_RETRY_MAX` | 0.5 / 10 | 采集循环遇 `DatabaseBusy` 的退避（秒） |
+| `GAP_REPAIR_MIN_INTERVAL` | 1.0 | 自动回退游标补缺口的间隔下限（秒） |
